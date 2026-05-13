@@ -8,6 +8,8 @@ import 'package:permission_handler/permission_handler.dart';
 import '../models/room.dart';
 import '../models/signal_log.dart';
 import '../services/database_service.dart';
+import '../services/signal_label_service.dart';
+import '../services/signal_smoothing_service.dart';
 import '../services/wifi_service.dart';
 
 class CanvasScreen extends StatefulWidget {
@@ -22,12 +24,18 @@ class CanvasScreen extends StatefulWidget {
 class _CanvasScreenState extends State<CanvasScreen> {
   final DatabaseService _databaseService = DatabaseService.instance;
   final WifiService _wifiService = WifiService();
+  final SignalLabelService _signalLabelService = const SignalLabelService();
+  final SignalSmoothingService _signalSmoothingService =
+      const SignalSmoothingService();
 
-  List<SignalLogEntry> _signalLogs = const [];
+  List<SignalLogEntry> _rawSignalLogs = const [];
+  List<SignalLogEntry> _visibleSignalLogs = const [];
   Size? _sourceImageSize;
   bool _isLoading = true;
   bool _canReadWifi = false;
   int? _liveDbm;
+  bool _isSmoothedView = false;
+  double _smoothRadius = 12.0;
 
   @override
   void initState() {
@@ -53,8 +61,10 @@ class _CanvasScreenState extends State<CanvasScreen> {
       setState(() {
         _canReadWifi = canReadWifi;
         _sourceImageSize = imageSize;
-        _signalLogs = logs;
+        _rawSignalLogs = logs;
+        _visibleSignalLogs = logs;
         _liveDbm = initialDbm;
+        _isSmoothedView = false;
       });
     } catch (error) {
       if (mounted) {
@@ -175,7 +185,32 @@ class _CanvasScreenState extends State<CanvasScreen> {
       return;
     }
     setState(() {
-      _signalLogs = logs;
+      _rawSignalLogs = logs;
+      _visibleSignalLogs = logs;
+      _isSmoothedView = false;
+    });
+  }
+
+  void _applySmoothing() {
+    if (_rawSignalLogs.isEmpty) {
+      return;
+    }
+
+    final smoothed = _signalSmoothingService.smooth(
+      _rawSignalLogs,
+      radius: _smoothRadius,
+    );
+
+    setState(() {
+      _visibleSignalLogs = smoothed;
+      _isSmoothedView = true;
+    });
+  }
+
+  void _resetSmoothing() {
+    setState(() {
+      _visibleSignalLogs = _rawSignalLogs;
+      _isSmoothedView = false;
     });
   }
 
@@ -293,7 +328,7 @@ class _CanvasScreenState extends State<CanvasScreen> {
       appBar: AppBar(title: Text(widget.room.name)),
       body: _isLoading
           ? const Center(child: CircularProgressIndicator())
-          : Padding(
+          : SingleChildScrollView(
               padding: const EdgeInsets.all(12),
               child: Column(
                 children: [
@@ -316,6 +351,30 @@ class _CanvasScreenState extends State<CanvasScreen> {
                     ),
                   ),
                   const SizedBox(height: 12),
+                  Wrap(
+                    spacing: 8,
+                    runSpacing: 6,
+                    crossAxisAlignment: WrapCrossAlignment.center,
+                    children: [
+                      const Text(
+                        'Simplify dots',
+                        style: TextStyle(fontWeight: FontWeight.w600),
+                      ),
+                      OutlinedButton.icon(
+                        onPressed: _applySmoothing,
+                        icon: const Icon(
+                          Icons.filter_center_focus_outlined,
+                          size: 18,
+                        ),
+                        label: const Text('Smoothen'),
+                      ),
+                      TextButton(
+                        onPressed: _isSmoothedView ? _resetSmoothing : null,
+                        child: const Text('Reset'),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 8),
                   SizedBox(
                     height: canvasHeight,
                     width: double.infinity,
@@ -338,6 +397,8 @@ class _CanvasScreenState extends State<CanvasScreen> {
                             image: sourceSize,
                           );
                           final dotSize = math.max(imageRect.width * 0.02, 8.0);
+                          _smoothRadius = dotSize * 2.8;
+                          final logsToRender = _visibleSignalLogs;
 
                           return GestureDetector(
                             onTapDown: (details) =>
@@ -364,24 +425,39 @@ class _CanvasScreenState extends State<CanvasScreen> {
                                     ),
                                   ),
                                 ),
-                                ..._signalLogs.map((log) {
+                                ...logsToRender.map((log) {
+                                  final smoothedDbm = _signalLabelService
+                                      .smoothedDbmFor(log, logsToRender);
+                                  final label = _signalLabelService.labelForDbm(
+                                    smoothedDbm,
+                                  );
+
                                   return Positioned(
                                     left:
                                         imageRect.left + log.x - (dotSize / 2),
                                     top: imageRect.top + log.y - (dotSize / 2),
                                     child: GestureDetector(
-                                      onTap: () => _confirmDeleteDot(log),
-                                      child: Container(
-                                        width: dotSize,
-                                        height: dotSize,
-                                        decoration: BoxDecoration(
-                                          color: _colorForDbm(log.dbm),
-                                          shape: BoxShape.circle,
-                                          border: Border.all(
-                                            color: Colors.black45,
-                                            width: 0.7,
+                                      onTap: _isSmoothedView
+                                          ? null
+                                          : () => _confirmDeleteDot(log),
+                                      child: Column(
+                                        mainAxisSize: MainAxisSize.min,
+                                        children: [
+                                          Container(
+                                            width: dotSize,
+                                            height: dotSize,
+                                            decoration: BoxDecoration(
+                                              color: _colorForDbm(log.dbm),
+                                              shape: BoxShape.circle,
+                                              border: Border.all(
+                                                color: Colors.black45,
+                                                width: 0.7,
+                                              ),
+                                            ),
                                           ),
-                                        ),
+                                          const SizedBox(height: 2),
+                                          _SignalLabel(text: label),
+                                        ],
                                       ),
                                     ),
                                   );
@@ -404,9 +480,44 @@ class _CanvasScreenState extends State<CanvasScreen> {
                       _LegendDot(color: Colors.red, label: '< -75 dBm'),
                     ],
                   ),
+                  const SizedBox(height: 6),
+                  const Text(
+                    'AI label uses neighbor smoothing.',
+                    style: TextStyle(fontSize: 12, color: Colors.black54),
+                  ),
+                  const SizedBox(height: 2),
+                  const Text(
+                    'Smoothen merges nearby dots into one.',
+                    style: TextStyle(fontSize: 12, color: Colors.black54),
+                  ),
                 ],
               ),
             ),
+    );
+  }
+}
+
+class _SignalLabel extends StatelessWidget {
+  const _SignalLabel({required this.text});
+
+  final String text;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
+      decoration: BoxDecoration(
+        color: Colors.white70,
+        borderRadius: BorderRadius.circular(6),
+      ),
+      child: Text(
+        text,
+        style: const TextStyle(
+          fontSize: 10,
+          fontWeight: FontWeight.w600,
+          color: Colors.black87,
+        ),
+      ),
     );
   }
 }
